@@ -146,21 +146,18 @@ def get_python_version():
 def get_available_python_versions():
     versions = {}
     for i in range(6, 15):
-        for j in range(0, 20):
-            cmd = f"python3.{i}.{j}" if j > 0 else f"python3.{i}"
-            if j > 0:
-                continue
-            path = shutil.which(cmd)
-            if path:
-                try:
-                    r = subprocess.run(
-                        [cmd, "--version"],
-                        capture_output=True, text=True, timeout=3
-                    )
-                    ver = r.stdout.strip() or r.stderr.strip()
-                    versions[cmd] = ver
-                except Exception:
-                    pass
+        cmd = f"python3.{i}"
+        path = shutil.which(cmd)
+        if path:
+            try:
+                r = subprocess.run(
+                    [cmd, "--version"],
+                    capture_output=True, text=True, timeout=3
+                )
+                ver = r.stdout.strip() or r.stderr.strip()
+                versions[cmd] = ver
+            except Exception:
+                pass
 
     for cmd in ["python3", "python"]:
         path = shutil.which(cmd)
@@ -181,10 +178,10 @@ def get_available_python_versions():
 def print_status():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    can_ok, can_msg     = check_can_bus()
-    net_ok, net_msg     = check_internet()
-    gps_ok, gps_msg     = check_gps()
-    py_ver              = get_python_version()
+    can_ok, can_msg = check_can_bus()
+    net_ok, net_msg = check_internet()
+    gps_ok, gps_msg = check_gps()
+    py_ver          = get_python_version()
 
     def status_icon(ok):
         if ok:
@@ -213,29 +210,56 @@ def cmd_python_version():
     else:
         print(f"  {Colors.YELLOW}Boshqa versiyalar topilmadi{Colors.RESET}")
 
+def _pkg_exists(pkg_name):
+    r = subprocess.run(
+        ["apt-cache", "show", pkg_name],
+        capture_output=True, text=True, timeout=5
+    )
+    return r.returncode == 0
+
 def cmd_install_python(version: str):
+    parts = version.split(".")
+    if len(parts) < 2:
+        print(f"{Colors.RED}Noto'g'ri format. Misol: 3.11{Colors.RESET}")
+        return
+
+    try:
+        minor = int(parts[1])
+    except ValueError:
+        minor = 0
+
     print(f"\n{Colors.YELLOW}Python {version} o'rnatilmoqda...{Colors.RESET}")
-    cmds = [
+
+    for cmd in [
         ["sudo", "apt-get", "update", "-y"],
         ["sudo", "add-apt-repository", "-y", "ppa:deadsnakes/ppa"],
-        ["sudo", "apt-get", "install", "-y", f"python{version}",
-         f"python{version}-distutils", f"python{version}-venv"],
-    ]
-    for cmd in cmds:
+    ]:
         print(f"  {Colors.CYAN}$ {' '.join(cmd)}{Colors.RESET}")
         result = subprocess.run(cmd, text=True)
         if result.returncode != 0:
-            print(f"  {Colors.RED}Xato yuz berdi!{Colors.RESET}")
+            print(f"  {Colors.RED}Xato yuz berdi! To'xtatildi.{Colors.RESET}")
             return
-    print(f"  {Colors.GREEN}Python {version} muvaffaqiyatli o'rnatildi!{Colors.RESET}")
+        print(f"  {Colors.GREEN}✔ OK{Colors.RESET}")
 
+    pkgs = [f"python{version}", f"python{version}-venv"]
+    if minor <= 11 and _pkg_exists(f"python{version}-distutils"):
+        pkgs.append(f"python{version}-distutils")
+
+    install_cmd = ["sudo", "apt-get", "install", "-y"] + pkgs
+    print(f"  {Colors.CYAN}$ {' '.join(install_cmd)}{Colors.RESET}")
+    result = subprocess.run(install_cmd, text=True)
+    if result.returncode != 0:
+        print(f"  {Colors.RED}Xato yuz berdi!{Colors.RESET}")
+        return
+
+    print(f"  {Colors.GREEN}Python {version} muvaffaqiyatli o'rnatildi!{Colors.RESET}")
     path = shutil.which(f"python{version}")
     if path:
         print(f"  Joylashuvi: {path}")
 
 def cmd_remove_python(version: str):
     print(f"\n{Colors.RED}Python {version} o'chirilmoqda...{Colors.RESET}")
-    cmd = ["sudo", "apt-get", "remove", "-y", f"python{version}"]
+    cmd = ["sudo", "apt-get", "remove", "--purge", "-y", f"python{version}"]
     print(f"  {Colors.CYAN}$ {' '.join(cmd)}{Colors.RESET}")
     result = subprocess.run(cmd, text=True)
     if result.returncode == 0:
