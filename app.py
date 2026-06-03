@@ -223,6 +223,11 @@ def cmd_install_python(version: str):
         print(f"{Colors.RED}Noto'g'ri format. Misol: 3.11{Colors.RESET}")
         return
 
+    apt_version = ".".join(parts[:2])
+    if len(parts) > 2:
+        print(f"  {Colors.YELLOW}⚠ apt faqat major.minor qabul qiladi: '{version}' → '{apt_version}' ishlatiladi{Colors.RESET}")
+    version = apt_version
+
     try:
         minor = int(parts[1])
     except ValueError:
@@ -267,6 +272,42 @@ def cmd_remove_python(version: str):
     else:
         print(f"  {Colors.RED}O'chirishda xato!{Colors.RESET}")
 
+def cmd_change_python(version: str):
+    parts = version.split(".")
+    apt_version = ".".join(parts[:2]) if len(parts) >= 2 else version
+
+    py_path = shutil.which(f"python{apt_version}")
+    if not py_path:
+        print(f"\n{Colors.RED}✘ python{apt_version} tizimda topilmadi!{Colors.RESET}")
+        print(f"  Avval o'rnating: {Colors.CYAN}python install {apt_version}{Colors.RESET}\n")
+        return
+
+    print(f"\n{Colors.YELLOW}Agent python{apt_version} da qayta ishga tushirilmoqda...{Colors.RESET}")
+    print(f"  {Colors.CYAN}Yangi interpreter: {py_path}{Colors.RESET}\n")
+
+    script = os.path.abspath(sys.argv[0])
+
+    _stop_event.set()
+    time.sleep(0.5)
+
+    os.execv(py_path, [py_path, script] + sys.argv[1:])
+
+def cmd_reboot():
+    print(f"\n{Colors.YELLOW}⚠  Tizim 3 soniyadan keyin reboot bo'ladi...{Colors.RESET}")
+    for i in range(3, 0, -1):
+        print(f"  {Colors.RED}{i}...{Colors.RESET}")
+        time.sleep(1)
+    print(f"  {Colors.CYAN}$ sudo reboot{Colors.RESET}")
+    subprocess.run(["sudo", "reboot"])
+
+def cmd_shutdown():
+    print(f"\n{Colors.YELLOW}⚠  Tizim 3 soniyadan keyin shutdown bo'ladi...{Colors.RESET}")
+    for i in range(3, 0, -1):
+        print(f"  {Colors.RED}{i}...{Colors.RESET}")
+        time.sleep(1)
+    print(f"  {Colors.CYAN}$ sudo shutdown -h now{Colors.RESET}")
+    subprocess.run(["sudo", "shutdown", "-h", "now"])
+
 def handle_command(cmd_line: str) -> bool:
     parts = cmd_line.strip().split()
     if not parts:
@@ -281,13 +322,16 @@ def handle_command(cmd_line: str) -> bool:
     elif cmd in ("help", "h", "?"):
         print(f"""
 {Colors.BOLD}Mavjud buyruqlar:{Colors.RESET}
-  {Colors.CYAN}status{Colors.RESET}                  — hozir tekshir va ko'rsat
-  {Colors.CYAN}python version{Colors.RESET}          — Python versiyalarini ko'rsat
-  {Colors.CYAN}python install <version>{Colors.RESET} — Python o'rnat (masalan: python install 3.11)
-  {Colors.CYAN}python remove <version>{Colors.RESET}  — Python o'chir  (masalan: python remove 3.10)
-  {Colors.CYAN}interval <soniya>{Colors.RESET}        — tekshirish intervalini o'zgartir (default: 60)
-  {Colors.CYAN}help{Colors.RESET}                    — shu yordam
-  {Colors.CYAN}exit{Colors.RESET}                    — agentni to'xtat
+  {Colors.CYAN}status{Colors.RESET}                   — hozir tekshir va ko'rsat
+  {Colors.CYAN}python version{Colors.RESET}           — Python versiyalarini ko'rsat
+  {Colors.CYAN}python install <version>{Colors.RESET}  — Python o'rnat   (misol: python install 3.11)
+  {Colors.CYAN}python remove  <version>{Colors.RESET}  — Python o'chir   (misol: python remove 3.10)
+  {Colors.CYAN}python change  <version>{Colors.RESET}  — Python almashtir (misol: python change 3.12)
+  {Colors.CYAN}interval <soniya>{Colors.RESET}         — tekshirish intervalini o'zgartir
+  {Colors.CYAN}reboot{Colors.RESET}                   — tizimni qayta yuklash
+  {Colors.CYAN}shutdown{Colors.RESET}                 — tizimni o'chirish
+  {Colors.CYAN}help{Colors.RESET}                     — shu yordam
+  {Colors.CYAN}exit{Colors.RESET}                     — agentni to'xtat
 """)
 
     elif cmd == "status":
@@ -302,6 +346,8 @@ def handle_command(cmd_line: str) -> bool:
             cmd_install_python(parts[2])
         elif parts[1] == "remove" and len(parts) >= 3:
             cmd_remove_python(parts[2])
+        elif parts[1] == "change" and len(parts) >= 3:
+            cmd_change_python(parts[2])
         else:
             print(f"  {Colors.RED}Noto'g'ri buyruq. 'help' yozing.{Colors.RESET}")
 
@@ -319,6 +365,12 @@ def handle_command(cmd_line: str) -> bool:
                 print(f"  {Colors.RED}Raqam kiriting!{Colors.RESET}")
         else:
             print(f"  {Colors.CYAN}Hozirgi interval: {CHECK_INTERVAL} soniya{Colors.RESET}")
+
+    elif cmd == "reboot":
+        cmd_reboot()
+
+    elif cmd == "shutdown":
+        cmd_shutdown()
 
     else:
         print(f"  {Colors.RED}Noma'lum buyruq: '{cmd}'. 'help' yozing.{Colors.RESET}")
