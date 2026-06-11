@@ -29,7 +29,7 @@ class Colors:
 #  CONFIG
 # ─────────────────────────────────────────
 TOKEN_URL      = "http://127.0.0.1:8787/token"
-API_BASE_URL   = "https://dev-gw.tracksafe365.com"
+API_BASE_URL   = "https://dev-gw.tracksafe365.com/services/glsstream"
 AI_RELEASE_URL = API_BASE_URL + "/api/ai-release/download-url/{model}/{version}"
 SW_RELEASE_URL = API_BASE_URL + "/api/software-release/download-url/{model}/{version}"
 
