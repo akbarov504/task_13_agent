@@ -1,18 +1,18 @@
-import os
-import re
-import sys
-import time
-import json
-import shutil
-import signal
-import socket
-import platform
-import threading
 import subprocess
-import urllib.error
+import socket
+import time
+import os
+import sys
+import shutil
+import re
+import threading
+import signal
+import platform
+import json
 import urllib.request
-from pathlib import Path
+import urllib.error
 from datetime import datetime
+from pathlib import Path
 
 class Colors:
     GREEN  = "\033[92m"
@@ -46,12 +46,13 @@ def get_token() -> str | None:
             req = urllib.request.Request(TOKEN_URL)
             with urllib.request.urlopen(req, timeout=5) as resp:
                 data = json.loads(resp.read().decode())
-            token = (
-                data.get("token") or
-                data.get("access_token") or
-                data.get("result", {}).get("token") if isinstance(data.get("result"), dict) else None or
-                (list(data.values())[0] if isinstance(data, dict) and len(data) == 1 else None)
-            )
+
+            token = data.get("token")
+            if not token:
+                token = data.get("access_token")
+            if not token and isinstance(data.get("result"), dict):
+                token = data["result"].get("token")
+
             if token:
                 _cached_token = str(token)
                 return _cached_token
@@ -451,7 +452,7 @@ def cmd_install_python(version: str):
     if len(parts) < 2:
         print(f"{Colors.RED}Noto'g'ri format. Misol: 3.11{Colors.RESET}")
         return
-    
+
     apt_version = ".".join(parts[:2])
     if len(parts) > 2:
         print(f"  {Colors.YELLOW}⚠ '{version}' → '{apt_version}' ishlatiladi{Colors.RESET}")
@@ -485,7 +486,7 @@ def cmd_install_python(version: str):
     if result.returncode != 0:
         print(f"  {Colors.RED}Xato yuz berdi!{Colors.RESET}")
         return
-    
+
     print(f"  {Colors.GREEN}Python {version} muvaffaqiyatli o'rnatildi!{Colors.RESET}")
     path = shutil.which(f"python{version}")
 
@@ -511,7 +512,7 @@ def cmd_change_python(version: str):
     if not py_path:
         print(f"\n{Colors.RED}✘ python{apt_version} topilmadi! Avval o'rnating.{Colors.RESET}\n")
         return
-    
+
     print(f"\n{Colors.YELLOW}Agent python{apt_version} da qayta ishga tushirilmoqda...{Colors.RESET}")
     print(f"  {Colors.CYAN}Yangi interpreter: {py_path}{Colors.RESET}\n")
     script = os.path.abspath(sys.argv[0])
@@ -698,7 +699,7 @@ def main():
             if not handle_command(cmd_line):
                 _stop_event.set()
                 break
-            
+
         except EOFError:
             print(f"\n{Colors.YELLOW}Stdin yo'q. Faqat monitoring rejimi.{Colors.RESET}")
             try:
