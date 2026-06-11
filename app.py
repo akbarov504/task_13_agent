@@ -29,9 +29,9 @@ class Colors:
 #  CONFIG
 # ─────────────────────────────────────────
 TOKEN_URL      = "http://127.0.0.1:8787/token"
-API_BASE_URL   = "https://dev-gw.tracksafe365.com/services/glsstream"
-AI_RELEASE_URL = API_BASE_URL + "/api/ai-release/download-url/{model}/{version}"
-SW_RELEASE_URL = API_BASE_URL + "/api/software-release/download-url/{model}/{version}"
+API_BASE_URL   = "https://dev-gw.tracksafe365.com"
+AI_RELEASE_URL = API_BASE_URL + "/services/glsstream/api/ai-release/download-url/{model}/{version}"
+SW_RELEASE_URL = API_BASE_URL + "/services/glsstream/api/software-release/download-url/{model}/{version}"
 
 # Agent bilan bir papkada saqlash
 BASE_DIR     = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -171,15 +171,31 @@ def cmd_install(kind: str, model: str, version: str):
     if not download_file(dl_url, dest):
         return
 
-    # ELF binary ekanligini tekshirish
+    # Binary ekanligini tekshirish (ELF=Linux, Mach-O=macOS, PE=Windows)
+    BINARY_MAGIC = [
+        b"\x7fELF",        # Linux ELF
+        b"\xcf\xfa\xed\xfe",  # macOS Mach-O 64-bit
+        b"\xce\xfa\xed\xfe",  # macOS Mach-O 32-bit
+        b"\xca\xfe\xba\xbe",  # macOS Fat binary
+        b"MZ",              # Windows PE
+    ]
     try:
         with open(dest, "rb") as f:
             magic = f.read(4)
-        if magic != b"\x7fELF":
-            print(f"  {Colors.RED}✘ Yuklangan fayl binary emas (ELF emas)!{Colors.RESET}")
+        is_binary = any(magic.startswith(m) for m in BINARY_MAGIC)
+        if not is_binary:
+            print(f"  {Colors.RED}✘ Yuklangan fayl binary emas!{Colors.RESET}")
             print(f"  {Colors.YELLOW}Fayl boshi: {magic}{Colors.RESET}")
             dest.unlink(missing_ok=True)
             return
+        # Binary turi
+        if magic.startswith(b"\x7fELF"):
+            btype = "Linux ELF"
+        elif magic[0:2] == b"MZ":
+            btype = "Windows PE"
+        else:
+            btype = "macOS Mach-O"
+        print(f"  {Colors.CYAN}Binary turi: {btype}{Colors.RESET}")
     except Exception as e:
         print(f"  {Colors.YELLOW}⚠ Binary tekshirishda xato: {e}{Colors.RESET}")
 
