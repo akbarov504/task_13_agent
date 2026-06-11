@@ -1,13 +1,17 @@
-import subprocess
-import socket
-import time
 import os
-import sys
-import shutil
 import re
-import threading
+import sys
+import time
+import json
+import shutil
 import signal
+import socket
 import platform
+import threading
+import subprocess
+import urllib.error
+import urllib.request
+from pathlib import Path
 from datetime import datetime
 
 class Colors:
@@ -19,6 +23,255 @@ class Colors:
     RESET  = "\033[0m"
     BLUE   = "\033[94m"
     WHITE  = "\033[97m"
+
+TOKEN_URL      = "http://127.0.0.1:8787/token"
+API_BASE_URL   = "https://dev-gw.tracksafe365.com/services/glsstream"
+AI_RELEASE_URL = API_BASE_URL + "/api/ai-release/download-url/{model}/{version}"
+SW_RELEASE_URL = API_BASE_URL + "/api/software-release/download-url/{model}/{version}"
+
+BASE_DIR     = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
+AI_DIR       = BASE_DIR / "ai"
+SW_DIR       = BASE_DIR / "software"
+AI_DIR.mkdir(exist_ok=True)
+SW_DIR.mkdir(exist_ok=True)
+
+_running_processes: dict = {}
+_cached_token: str | None = None
+_token_lock = threading.Lock()
+
+def get_token() -> str | None:
+    global _cached_token
+    with _token_lock:
+        try:
+            req = urllib.request.Request(TOKEN_URL)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+            token = (
+                data.get("token") or
+                data.get("access_token") or
+                data.get("result", {}).get("token") if isinstance(data.get("result"), dict) else None or
+                (list(data.values())[0] if isinstance(data, dict) and len(data) == 1 else None)
+            )
+            if token:
+                _cached_token = str(token)
+                return _cached_token
+            print(f"  {Colors.RED}Token topilmadi. Response: {data}{Colors.RESET}")
+            return None
+        except Exception as e:
+            print(f"  {Colors.RED}Token olishda xato: {e}{Colors.RESET}")
+            return None
+
+def get_download_url(kind: str, model: str, version: str) -> str | None:
+    token = get_token()
+    if not token:
+        return None
+
+    if kind == "ai":
+        url = AI_RELEASE_URL.format(model=model, version=version)
+    else:
+        url = SW_RELEASE_URL.format(model=model, version=version)
+
+    try:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        return data.get("url")
+    except urllib.error.HTTPError as e:
+        print(f"  {Colors.RED}API xato {e.code}: {e.reason}{Colors.RESET}")
+        return None
+    except Exception as e:
+        print(f"  {Colors.RED}Download URL olishda xato: {e}{Colors.RESET}")
+        return None
+
+def download_file(url: str, dest: Path) -> bool:
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        print(f"  {Colors.CYAN}Yuklanmoqda...{Colors.RESET}", end="", flush=True)
+
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            total = int(resp.headers.get("Content-Length", 0))
+            downloaded = 0
+            chunk_size = 8192
+            with open(dest, "wb") as f:
+                while True:
+                    chunk = resp.read(chunk_size)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total:
+                        pct = downloaded * 100 // total
+                        print(f"\r  {Colors.CYAN}Yuklanmoqda... {pct}%{Colors.RESET}  ", end="", flush=True)
+
+        print(f"\r  {Colors.GREEN}✔ Yuklandi: {dest}{Colors.RESET}          ")
+        dest.chmod(0o755)
+        return True
+    except Exception as e:
+        print(f"\r  {Colors.RED}✘ Yuklashda xato: {e}{Colors.RESET}")
+        return False
+
+def meta_path(kind: str) -> Path:
+    base = AI_DIR if kind == "ai" else SW_DIR
+    return base / "installed.json"
+
+def load_meta(kind: str) -> dict:
+    p = meta_path(kind)
+    if p.exists():
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_meta(kind: str, meta: dict):
+    meta_path(kind).write_text(json.dumps(meta, indent=2))
+
+def get_binary_path(kind: str, model: str, version: str) -> Path:
+    base = AI_DIR if kind == "ai" else SW_DIR
+    return base / model / version / model
+
+def cmd_install(kind: str, model: str, version: str):
+    label = "AI" if kind == "ai" else "Software"
+    print(f"\n{Colors.YELLOW}{label} '{model} v{version}' o'rnatilmoqda...{Colors.RESET}")
+
+    dl_url = get_download_url(kind, model, version)
+    if not dl_url:
+        print(f"  {Colors.RED}✘ Download URL olinmadi.{Colors.RESET}\n")
+        return
+
+    dest = get_binary_path(kind, model, version)
+    if not download_file(dl_url, dest):
+        return
+
+    meta = load_meta(kind)
+    if model not in meta:
+        meta[model] = {}
+
+    meta[model][version] = {
+        "installed_at": datetime.now().isoformat(),
+        "path": str(dest)
+    }
+
+    save_meta(kind, meta)
+    print(f"  {Colors.GREEN}✔ {label} '{model} v{version}' tayyor!{Colors.RESET}\n")
+
+def cmd_list(kind: str):
+    label = "AI" if kind == "ai" else "Software"
+    meta = load_meta(kind)
+
+    print(f"\n{Colors.BOLD}O'rnatilgan {label} modellari:{Colors.RESET}")
+    if not meta:
+        print(f"  {Colors.YELLOW}Hech narsa o'rnatilmagan{Colors.RESET}")
+    else:
+        for model, versions in meta.items():
+            print(f"\n  {Colors.CYAN}{model}{Colors.RESET}")
+            for ver, info in versions.items():
+                key = f"{kind}/{model}/{ver}"
+                running = key in _running_processes and _running_processes[key].poll() is None
+                status = f"{Colors.GREEN}● ISHLAYAPTI{Colors.RESET}" if running else f"{Colors.RED}○ to'xtagan{Colors.RESET}"
+                print(f"    v{ver}  {status}  [{info['installed_at'][:10]}]")
+    print()
+
+def cmd_run(kind: str, model: str, version: str):
+    label = "AI" if kind == "ai" else "Software"
+    key = f"{kind}/{model}/{version}"
+
+    if key in _running_processes and _running_processes[key].poll() is None:
+        print(f"\n  {Colors.YELLOW}⚠ '{model} v{version}' allaqachon ishlayapti (PID: {_running_processes[key].pid}){Colors.RESET}\n")
+        return
+
+    binary = get_binary_path(kind, model, version)
+    if not binary.exists():
+        print(f"\n  {Colors.RED}✘ Binary topilmadi: {binary}{Colors.RESET}")
+        print(f"  Avval o'rnating: {Colors.CYAN}{kind} install {model} {version}{Colors.RESET}\n")
+        return
+
+    log_dir = binary.parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    log_file = log_dir / f"{model}_{version}.log"
+
+    print(f"\n{Colors.YELLOW}{label} '{model} v{version}' ishga tushirilmoqda...{Colors.RESET}")
+    print(f"  Log fayl: {log_file}")
+
+    try:
+        log_fd = open(log_file, "a")
+        log_fd.write(f"\n{'='*50}\nStarted: {datetime.now().isoformat()}\n{'='*50}\n")
+        log_fd.flush()
+
+        proc = subprocess.Popen(
+            [str(binary)],
+            stdout=log_fd,
+            stderr=log_fd,
+            cwd=str(binary.parent)
+        )
+        _running_processes[key] = proc
+        print(f"  {Colors.GREEN}✔ Ishga tushdi! PID: {proc.pid}{Colors.RESET}\n")
+    except Exception as e:
+        print(f"  {Colors.RED}✘ Ishga tushirishda xato: {e}{Colors.RESET}\n")
+
+def cmd_stop(kind: str, model: str, version: str):
+    key = f"{kind}/{model}/{version}"
+
+    if key not in _running_processes or _running_processes[key].poll() is not None:
+        print(f"\n  {Colors.YELLOW}'{model} v{version}' ishlamayapti.{Colors.RESET}\n")
+        return
+
+    proc = _running_processes[key]
+    print(f"\n{Colors.YELLOW}'{model} v{version}' to'xtatilmoqda (PID: {proc.pid})...{Colors.RESET}")
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        print(f"  {Colors.RED}Force kill qilindi.{Colors.RESET}")
+    del _running_processes[key]
+    print(f"  {Colors.GREEN}✔ To'xtatildi.{Colors.RESET}\n")
+
+def cmd_remove(kind: str, model: str, version: str):
+    label = "AI" if kind == "ai" else "Software"
+    key = f"{kind}/{model}/{version}"
+
+    if key in _running_processes and _running_processes[key].poll() is None:
+        cmd_stop(kind, model, version)
+
+    binary = get_binary_path(kind, model, version)
+    if binary.parent.exists():
+        shutil.rmtree(binary.parent)
+        print(f"  {Colors.GREEN}✔ {label} '{model} v{version}' o'chirildi.{Colors.RESET}")
+    else:
+        print(f"  {Colors.YELLOW}Fayl topilmadi: {binary.parent}{Colors.RESET}")
+
+    meta = load_meta(kind)
+    if model in meta and version in meta[model]:
+        del meta[model][version]
+        if not meta[model]:
+            del meta[model]
+        save_meta(kind, meta)
+
+    print()
+
+def cmd_logs(kind: str, model: str, version: str, lines: int = 50):
+    binary = get_binary_path(kind, model, version)
+    log_file = binary.parent / "logs" / f"{model}_{version}.log"
+
+    if not log_file.exists():
+        print(f"\n  {Colors.YELLOW}Log fayl topilmadi: {log_file}{Colors.RESET}\n")
+        return
+
+    print(f"\n{Colors.BOLD}Log: {log_file} (oxirgi {lines} qator){Colors.RESET}")
+    print(Colors.CYAN + "─" * 55 + Colors.RESET)
+
+    try:
+        result = subprocess.run(
+            ["tail", "-n", str(lines), str(log_file)],
+            capture_output=True, text=True
+        )
+        print(result.stdout)
+    except Exception as e:
+        print(f"  {Colors.RED}Log o'qishda xato: {e}{Colors.RESET}")
+
+    print(Colors.CYAN + "─" * 55 + Colors.RESET + "\n")
 
 def check_can_bus():
     try:
@@ -47,10 +300,7 @@ def check_can_bus():
             return False, "CAN interfeys topilmadi"
     except FileNotFoundError:
         try:
-            result = subprocess.run(
-                ["ifconfig"],
-                capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=5)
             if "can" in result.stdout.lower():
                 return True, "CAN interfeys mavjud (ifconfig)"
             return False, "CAN interfeys topilmadi"
@@ -60,11 +310,7 @@ def check_can_bus():
         return False, f"Xato: {e}"
 
 def check_internet():
-    hosts = [
-        ("8.8.8.8", 53),       # Google DNS
-        ("1.1.1.1", 53),       # Cloudflare DNS
-        ("208.67.222.222", 53) # OpenDNS
-    ]
+    hosts = [("8.8.8.8", 53), ("1.1.1.1", 53), ("208.67.222.222", 53)]
     for host, port in hosts:
         try:
             sock = socket.create_connection((host, port), timeout=3)
@@ -125,12 +371,8 @@ def check_gps():
         return True, f"GPS port topildi: {', '.join(gps_ports)}"
 
     try:
-        result = subprocess.run(
-            ["lsusb"],
-            capture_output=True, text=True, timeout=5
-        )
-        gps_keywords = ["GPS", "u-blox", "SiRF", "MTK", "Globalsat", "Garmin"]
-        for keyword in gps_keywords:
+        result = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5)
+        for keyword in ["GPS", "u-blox", "SiRF", "MTK", "Globalsat", "Garmin"]:
             if keyword.lower() in result.stdout.lower():
                 return True, f"GPS USB qurilma topildi: {keyword}"
     except Exception:
@@ -150,10 +392,7 @@ def get_available_python_versions():
         path = shutil.which(cmd)
         if path:
             try:
-                r = subprocess.run(
-                    [cmd, "--version"],
-                    capture_output=True, text=True, timeout=3
-                )
+                r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=3)
                 ver = r.stdout.strip() or r.stderr.strip()
                 versions[cmd] = ver
             except Exception:
@@ -163,10 +402,7 @@ def get_available_python_versions():
         path = shutil.which(cmd)
         if path:
             try:
-                r = subprocess.run(
-                    [cmd, "--version"],
-                    capture_output=True, text=True, timeout=3
-                )
+                r = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=3)
                 ver = r.stdout.strip() or r.stderr.strip()
                 if ver:
                     versions[cmd] = ver
@@ -177,19 +413,15 @@ def get_available_python_versions():
 
 def print_status():
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
     can_ok, can_msg = check_can_bus()
     net_ok, net_msg = check_internet()
     gps_ok, gps_msg = check_gps()
     py_ver          = get_python_version()
 
     def status_icon(ok):
-        if ok:
-            return f"{Colors.GREEN}✔ ISHLAYAPTI{Colors.RESET}"
-        return f"{Colors.RED}✘ ISHLAMAYAPTI{Colors.RESET}"
+        return f"{Colors.GREEN}✔ ISHLAYAPTI{Colors.RESET}" if ok else f"{Colors.RED}✘ ISHLAMAYAPTI{Colors.RESET}"
 
     sep = Colors.CYAN + "─" * 55 + Colors.RESET
-
     print(f"\n{sep}")
     print(f"  {Colors.BOLD}{Colors.WHITE}SYSTEM AGENT  [{now}]{Colors.RESET}")
     print(sep)
@@ -211,10 +443,7 @@ def cmd_python_version():
         print(f"  {Colors.YELLOW}Boshqa versiyalar topilmadi{Colors.RESET}")
 
 def _pkg_exists(pkg_name):
-    r = subprocess.run(
-        ["apt-cache", "show", pkg_name],
-        capture_output=True, text=True, timeout=5
-    )
+    r = subprocess.run(["apt-cache", "show", pkg_name], capture_output=True, text=True, timeout=5)
     return r.returncode == 0
 
 def cmd_install_python(version: str):
@@ -222,10 +451,10 @@ def cmd_install_python(version: str):
     if len(parts) < 2:
         print(f"{Colors.RED}Noto'g'ri format. Misol: 3.11{Colors.RESET}")
         return
-
+    
     apt_version = ".".join(parts[:2])
     if len(parts) > 2:
-        print(f"  {Colors.YELLOW}⚠ apt faqat major.minor qabul qiladi: '{version}' → '{apt_version}' ishlatiladi{Colors.RESET}")
+        print(f"  {Colors.YELLOW}⚠ '{version}' → '{apt_version}' ishlatiladi{Colors.RESET}")
     version = apt_version
 
     try:
@@ -234,7 +463,6 @@ def cmd_install_python(version: str):
         minor = 0
 
     print(f"\n{Colors.YELLOW}Python {version} o'rnatilmoqda...{Colors.RESET}")
-
     for cmd in [
         ["sudo", "apt-get", "update", "-y"],
         ["sudo", "add-apt-repository", "-y", "ppa:deadsnakes/ppa"],
@@ -253,12 +481,14 @@ def cmd_install_python(version: str):
     install_cmd = ["sudo", "apt-get", "install", "-y"] + pkgs
     print(f"  {Colors.CYAN}$ {' '.join(install_cmd)}{Colors.RESET}")
     result = subprocess.run(install_cmd, text=True)
+
     if result.returncode != 0:
         print(f"  {Colors.RED}Xato yuz berdi!{Colors.RESET}")
         return
-
+    
     print(f"  {Colors.GREEN}Python {version} muvaffaqiyatli o'rnatildi!{Colors.RESET}")
     path = shutil.which(f"python{version}")
+
     if path:
         print(f"  Joylashuvi: {path}")
 
@@ -267,6 +497,7 @@ def cmd_remove_python(version: str):
     cmd = ["sudo", "apt-get", "remove", "--purge", "-y", f"python{version}"]
     print(f"  {Colors.CYAN}$ {' '.join(cmd)}{Colors.RESET}")
     result = subprocess.run(cmd, text=True)
+
     if result.returncode == 0:
         print(f"  {Colors.GREEN}Python {version} o'chirildi!{Colors.RESET}")
     else:
@@ -275,21 +506,17 @@ def cmd_remove_python(version: str):
 def cmd_change_python(version: str):
     parts = version.split(".")
     apt_version = ".".join(parts[:2]) if len(parts) >= 2 else version
-
     py_path = shutil.which(f"python{apt_version}")
-    if not py_path:
-        print(f"\n{Colors.RED}✘ python{apt_version} tizimda topilmadi!{Colors.RESET}")
-        print(f"  Avval o'rnating: {Colors.CYAN}python install {apt_version}{Colors.RESET}\n")
-        return
 
+    if not py_path:
+        print(f"\n{Colors.RED}✘ python{apt_version} topilmadi! Avval o'rnating.{Colors.RESET}\n")
+        return
+    
     print(f"\n{Colors.YELLOW}Agent python{apt_version} da qayta ishga tushirilmoqda...{Colors.RESET}")
     print(f"  {Colors.CYAN}Yangi interpreter: {py_path}{Colors.RESET}\n")
-
     script = os.path.abspath(sys.argv[0])
-
     _stop_event.set()
     time.sleep(0.5)
-
     os.execv(py_path, [py_path, script] + sys.argv[1:])
 
 def cmd_reboot():
@@ -297,7 +524,6 @@ def cmd_reboot():
     for i in range(3, 0, -1):
         print(f"  {Colors.RED}{i}...{Colors.RESET}")
         time.sleep(1)
-    print(f"  {Colors.CYAN}$ sudo reboot{Colors.RESET}")
     subprocess.run(["sudo", "reboot"])
 
 def cmd_shutdown():
@@ -305,7 +531,6 @@ def cmd_shutdown():
     for i in range(3, 0, -1):
         print(f"  {Colors.RED}{i}...{Colors.RESET}")
         time.sleep(1)
-    print(f"  {Colors.CYAN}$ sudo shutdown -h now{Colors.RESET}")
     subprocess.run(["sudo", "shutdown", "-h", "now"])
 
 def handle_command(cmd_line: str) -> bool:
@@ -321,17 +546,37 @@ def handle_command(cmd_line: str) -> bool:
 
     elif cmd in ("help", "h", "?"):
         print(f"""
-{Colors.BOLD}Mavjud buyruqlar:{Colors.RESET}
-  {Colors.CYAN}status{Colors.RESET}                   — hozir tekshir va ko'rsat
-  {Colors.CYAN}python version{Colors.RESET}           — Python versiyalarini ko'rsat
-  {Colors.CYAN}python install <version>{Colors.RESET}  — Python o'rnat   (misol: python install 3.11)
-  {Colors.CYAN}python remove  <version>{Colors.RESET}  — Python o'chir   (misol: python remove 3.10)
-  {Colors.CYAN}python change  <version>{Colors.RESET}  — Python almashtir (misol: python change 3.12)
-  {Colors.CYAN}interval <soniya>{Colors.RESET}         — tekshirish intervalini o'zgartir
-  {Colors.CYAN}reboot{Colors.RESET}                   — tizimni qayta yuklash
-  {Colors.CYAN}shutdown{Colors.RESET}                 — tizimni o'chirish
-  {Colors.CYAN}help{Colors.RESET}                     — shu yordam
-  {Colors.CYAN}exit{Colors.RESET}                     — agentni to'xtat
+{Colors.BOLD}Buyruqlar:{Colors.RESET}
+
+  {Colors.BOLD}{Colors.WHITE}[ SYSTEM ]{Colors.RESET}
+  {Colors.CYAN}status{Colors.RESET}                        — CAN/Internet/GPS/Python tekshir
+  {Colors.CYAN}reboot{Colors.RESET}                        — tizimni qayta yuklash
+  {Colors.CYAN}shutdown{Colors.RESET}                      — tizimni o'chirish
+
+  {Colors.BOLD}{Colors.WHITE}[ PYTHON ]{Colors.RESET}
+  {Colors.CYAN}python version{Colors.RESET}                — versiyalarni ko'rsat
+  {Colors.CYAN}python install <ver>{Colors.RESET}           — o'rnat   (python install 3.11)
+  {Colors.CYAN}python remove  <ver>{Colors.RESET}           — o'chir   (python remove 3.10)
+  {Colors.CYAN}python change  <ver>{Colors.RESET}           — almashtir (python change 3.12)
+  {Colors.CYAN}interval <soniya>{Colors.RESET}              — monitoring intervalini o'zgartir
+
+  {Colors.BOLD}{Colors.WHITE}[ AI MODELS ]{Colors.RESET}
+  {Colors.CYAN}ai install <model> <version>{Colors.RESET}  — AI model yuklab o'rnat
+  {Colors.CYAN}ai list{Colors.RESET}                       — o'rnatilgan AI modellar
+  {Colors.CYAN}ai run     <model> <version>{Colors.RESET}  — AI model ishga tushir
+  {Colors.CYAN}ai stop    <model> <version>{Colors.RESET}  — AI model to'xtat
+  {Colors.CYAN}ai remove  <model> <version>{Colors.RESET}  — AI model o'chir
+  {Colors.CYAN}ai logs    <model> <version>{Colors.RESET}  — AI model loglari
+
+  {Colors.BOLD}{Colors.WHITE}[ SOFTWARE ]{Colors.RESET}
+  {Colors.CYAN}sw install <model> <version>{Colors.RESET}  — Software yuklab o'rnat
+  {Colors.CYAN}sw list{Colors.RESET}                       — o'rnatilgan softwarelar
+  {Colors.CYAN}sw run     <model> <version>{Colors.RESET}  — Software ishga tushir
+  {Colors.CYAN}sw stop    <model> <version>{Colors.RESET}  — Software to'xtat
+  {Colors.CYAN}sw remove  <model> <version>{Colors.RESET}  — Software o'chir
+  {Colors.CYAN}sw logs    <model> <version>{Colors.RESET}  — Software loglari
+
+  {Colors.CYAN}exit{Colors.RESET}                          — chiqish
 """)
 
     elif cmd == "status":
@@ -354,21 +599,58 @@ def handle_command(cmd_line: str) -> bool:
     elif cmd == "interval":
         if len(parts) >= 2:
             try:
-                new_interval = int(parts[1])
-                if new_interval < 5:
+                val = int(parts[1])
+                if val < 5:
                     print(f"  {Colors.YELLOW}Minimal interval 5 soniya.{Colors.RESET}")
                 else:
                     global CHECK_INTERVAL
-                    CHECK_INTERVAL = new_interval
-                    print(f"  {Colors.GREEN}Interval {new_interval} soniyaga o'zgartirildi.{Colors.RESET}")
+                    CHECK_INTERVAL = val
+                    print(f"  {Colors.GREEN}Interval {val} soniyaga o'zgartirildi.{Colors.RESET}")
             except ValueError:
                 print(f"  {Colors.RED}Raqam kiriting!{Colors.RESET}")
         else:
-            print(f"  {Colors.CYAN}Hozirgi interval: {CHECK_INTERVAL} soniya{Colors.RESET}")
+            print(f"  Hozirgi interval: {CHECK_INTERVAL} soniya")
+
+    elif cmd == "ai":
+        if len(parts) < 2:
+            print(f"  {Colors.RED}Buyruq kerak. 'help' yozing.{Colors.RESET}")
+        elif parts[1] == "list":
+            cmd_list("ai")
+        elif parts[1] == "install" and len(parts) >= 4:
+            cmd_install("ai", parts[2], parts[3])
+        elif parts[1] == "run" and len(parts) >= 4:
+            cmd_run("ai", parts[2], parts[3])
+        elif parts[1] == "stop" and len(parts) >= 4:
+            cmd_stop("ai", parts[2], parts[3])
+        elif parts[1] == "remove" and len(parts) >= 4:
+            cmd_remove("ai", parts[2], parts[3])
+        elif parts[1] == "logs" and len(parts) >= 4:
+            lines = int(parts[4]) if len(parts) >= 5 else 50
+            cmd_logs("ai", parts[2], parts[3], lines)
+        else:
+            print(f"  {Colors.RED}Noto'g'ri buyruq. Misol: ai install safety 1.0.0{Colors.RESET}")
+
+    elif cmd == "sw":
+        if len(parts) < 2:
+            print(f"  {Colors.RED}Buyruq kerak. 'help' yozing.{Colors.RESET}")
+        elif parts[1] == "list":
+            cmd_list("sw")
+        elif parts[1] == "install" and len(parts) >= 4:
+            cmd_install("sw", parts[2], parts[3])
+        elif parts[1] == "run" and len(parts) >= 4:
+            cmd_run("sw", parts[2], parts[3])
+        elif parts[1] == "stop" and len(parts) >= 4:
+            cmd_stop("sw", parts[2], parts[3])
+        elif parts[1] == "remove" and len(parts) >= 4:
+            cmd_remove("sw", parts[2], parts[3])
+        elif parts[1] == "logs" and len(parts) >= 4:
+            lines = int(parts[4]) if len(parts) >= 5 else 50
+            cmd_logs("sw", parts[2], parts[3], lines)
+        else:
+            print(f"  {Colors.RED}Noto'g'ri buyruq. Misol: sw install safety 1.0.0{Colors.RESET}")
 
     elif cmd == "reboot":
         cmd_reboot()
-
     elif cmd == "shutdown":
         cmd_shutdown()
 
@@ -401,7 +683,7 @@ def main():
     print(f"""
 {Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════╗
 ║         SYSTEM MONITOR AGENT             ║
-║   CAN Bus | Internet | GPS | Python      ║
+║  CAN | Internet | GPS | Python | AI | SW ║
 ╚══════════════════════════════════════════╝{Colors.RESET}
   {Colors.WHITE}Har {CHECK_INTERVAL} soniyada avtomatik tekshiradi.{Colors.RESET}
   {Colors.WHITE}'help' buyrug'i uchun yordam.{Colors.RESET}
@@ -416,6 +698,7 @@ def main():
             if not handle_command(cmd_line):
                 _stop_event.set()
                 break
+            
         except EOFError:
             print(f"\n{Colors.YELLOW}Stdin yo'q. Faqat monitoring rejimi.{Colors.RESET}")
             try:
@@ -423,6 +706,7 @@ def main():
             except KeyboardInterrupt:
                 pass
             break
+
         except KeyboardInterrupt:
             _stop_event.set()
             print(f"\n{Colors.YELLOW}Agent to'xtatildi.{Colors.RESET}\n")
