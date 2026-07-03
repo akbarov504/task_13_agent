@@ -26,8 +26,8 @@ class Colors:
 
 TOKEN_URL      = "http://127.0.0.1:8787/token"
 API_BASE_URL   = "https://dev-gw.tracksafe365.com"
-AI_RELEASE_URL = API_BASE_URL + "/services/glsstream/api/ai-release/download-url/{model}/{version}"
-SW_RELEASE_URL = API_BASE_URL + "/services/glsstream/api/software-release/download-url/{model}/{version}"
+AI_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/ai-release/download-url/{model}/{version}"
+SW_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/software-release/download-url/{model}/{version}"
 
 BASE_DIR     = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 AI_DIR       = BASE_DIR / "ai"
