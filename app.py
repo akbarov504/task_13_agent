@@ -1,13 +1,14 @@
 import os
 import re
 import sys
+import ssl
 import time
 import json
+import random
+import string
 import socket
 import shutil
 import signal
-import random
-import string
 import platform
 import threading
 import subprocess
@@ -33,9 +34,12 @@ API_BASE_URL   = "https://dev-gw.tracksafe365.com"
 AI_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/ai-release/download-url/{model}/{version}"
 SW_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/software-release/download-url/{model}/{version}"
 
-WS_URL   = "wss://dev-gw.tracksafe365.com/services/glsstream/stream"
-WS_HOST  = "dev-gw.tracksafe365.com"
-WS_TOPIC = "/topic/agent/command"
+WS_BASE            = "wss://dev-gw.tracksafe365.com/services/glsstream/stream"
+WS_HOST            = "dev-gw.tracksafe365.com"
+WS_TOPIC           = "/topic/agent/command"
+DISABLE_SSL_VERIFY = False
+PING_INTERVAL      = 25
+PING_TIMEOUT       = 10
 
 TYPE_MAP = {"ai": "ai", "software": "sw"}
 
@@ -52,13 +56,6 @@ _cached_token: str | None = None
 _token_lock = threading.Lock()
 _state_lock = threading.Lock()
 _ws_action_lock = threading.Lock()
-
-def gen_server_id() -> str:
-    return f"{random.randint(0, 999):03d}"
-
-def gen_session_id(n: int = 8) -> str:
-    alphabet = string.ascii_lowercase + string.digits
-    return "".join(random.choice(alphabet) for _ in range(n))
 
 def get_token() -> str | None:
     global _cached_token
@@ -685,7 +682,6 @@ def ws_handle_revert(kind: str, model: str, version: str):
         cmd_remove(kind, model, version)
         cmd_install(kind, model, prev_version)
         cmd_run(kind, model, prev_version)
-        # current/prev joylarini svop qilamiz
         set_model_state(kind, model, current_version=prev_version, prev_version=version)
 
 def ws_dispatch(payload: dict):
@@ -718,103 +714,161 @@ def ws_dispatch(payload: dict):
     except Exception as e:
         print(f"  {Colors.RED}✘ WS command bajarishda xato: {e}{Colors.RESET}")
 
-class StompWsClient:
-    def __init__(self, url: str, host: str, topic: str):
-        self.url = url
+NULL_BYTE = "\x00"
+
+def _gen_server_id() -> str:
+    return f"{random.randint(0, 999):03d}"
+
+def _gen_session_id(n: int = 8) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
+
+def _build_sockjs_ws_url(ws_base: str) -> tuple[str, str]:
+    server_id = _gen_server_id()
+    session_id = _gen_session_id(8)
+    url = f"{ws_base}/{server_id}/{session_id}/websocket"
+    return url, session_id
+
+def _build_stomp_frame(command: str, headers: dict | None = None, body: str = "") -> str:
+    headers = headers or {}
+    lines = [command]
+    for k, v in headers.items():
+        lines.append(f"{k}:{v}")
+    lines.append("")
+    return "\n".join(lines) + "\n" + (body or "") + NULL_BYTE
+
+def _parse_stomp_frame(raw: str):
+    raw = raw.lstrip("\n")
+    if NULL_BYTE in raw:
+        raw = raw.split(NULL_BYTE, 1)[0]
+    head, _, body = raw.partition("\n\n")
+    lines = head.split("\n")
+    cmd = lines[0].strip() if lines else ""
+    headers = {}
+    for line in lines[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip()] = v.strip()
+    return cmd, headers, body
+
+def _sockjs_send(ws, stomp_frame: str):
+    ws.send(json.dumps([stomp_frame]))
+
+class SockJSTompClient:
+    def __init__(self, ws_base: str, host: str, topic: str,
+                 disable_ssl_verify: bool = False,
+                 ping_interval: int = 25, ping_timeout: int = 10):
+        self.ws_base = ws_base
         self.host = host
         self.topic = topic
-        self.ws = None
+        self.disable_ssl_verify = disable_ssl_verify
+        self.ping_interval = ping_interval
+        self.ping_timeout = ping_timeout
+
+        self.ws: websocket.WebSocketApp | None = None
         self._connected = threading.Event()
         self._stop = threading.Event()
-        self._buffer = ""
-
-    @staticmethod
-    def _build_frame(command: str, headers: dict, body: str = "") -> str:
-        lines = [command]
-        for k, v in headers.items():
-            lines.append(f"{k}:{v}")
-        return "\n".join(lines) + "\n\n" + body + "\x00"
 
     def _on_open(self, ws):
+        token = get_token()
         headers = {
-            "accept-version": "1.1,1.2",
+            "accept-version": "1.2",
             "host": self.host,
             "heart-beat": "10000,10000",
         }
-        token = get_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
-        ws.send(self._build_frame("CONNECT", headers))
+        frame = _build_stomp_frame("CONNECT", headers)
+        _sockjs_send(ws, frame)
+        print(f"  {Colors.CYAN}WS OPEN + STOMP CONNECT yuborildi{Colors.RESET}")
 
-    def _on_message(self, ws, message):
-        self._buffer += message
-        while "\x00" in self._buffer:
-            raw, self._buffer = self._buffer.split("\x00", 1)
-            self._process_frame(raw.lstrip("\n"))
+    def _subscribe(self):
+        frame = _build_stomp_frame(
+            "SUBSCRIBE",
+            {"id": "sub-agent-cmd", "destination": self.topic, "ack": "auto"},
+        )
+        _sockjs_send(self.ws, frame)
+        print(f"  {Colors.CYAN}Subscribed: {self.topic}{Colors.RESET}")
 
-    def _process_frame(self, raw: str):
-        if not raw.strip():
+    def _on_ws_message(self, ws, message: str):
+        if message in ("o", "h"):
             return
 
-        if "\n\n" in raw:
-            head, body = raw.split("\n\n", 1)
-        else:
-            head, body = raw, ""
+        if message.startswith("c"):
+            print(f"  {Colors.YELLOW}SockJS CLOSE: {message}{Colors.RESET}")
+            return
 
-        head_lines = head.split("\n")
-        frame_cmd = head_lines[0].strip()
+        if not message.startswith("a"):
+            return
 
-        if frame_cmd == "CONNECTED":
-            self._connected.set()
-            print(f"  {Colors.GREEN}✔ WS/STOMP ulandi: {self.url}{Colors.RESET}")
-            sub_headers = {
-                "id": "sub-agent-cmd",
-                "destination": self.topic,
-                "ack": "auto",
-            }
-            self.ws.send(self._build_frame("SUBSCRIBE", sub_headers))
-            print(f"  {Colors.CYAN}Subscribed: {self.topic}{Colors.RESET}")
+        try:
+            frames = json.loads(message[1:])
+        except Exception as e:
+            print(f"  {Colors.RED}SockJS parse xato: {e} | {message[:200]}{Colors.RESET}")
+            return
 
-        elif frame_cmd == "MESSAGE":
-            body = body.strip()
-            if body:
-                try:
-                    payload = json.loads(body)
-                except Exception as e:
-                    print(f"  {Colors.RED}✘ MESSAGE JSON parse xato: {e} | body={body}{Colors.RESET}")
-                    return
-                threading.Thread(target=ws_dispatch, args=(payload,), daemon=True).start()
+        for fr in frames:
+            cmd, headers, body = _parse_stomp_frame(fr)
 
-        elif frame_cmd == "ERROR":
-            print(f"  {Colors.RED}✘ STOMP ERROR: {body}{Colors.RESET}")
+            if cmd == "CONNECTED":
+                self._connected.set()
+                print(f"  {Colors.GREEN}✔ STOMP CONNECTED{Colors.RESET}")
+                self._subscribe()
+                continue
 
-    def _on_error(self, ws, error):
+            if cmd == "ERROR":
+                print(f"  {Colors.RED}STOMP ERROR: {headers} | {body[:300]}{Colors.RESET}")
+                continue
+
+            if cmd == "MESSAGE":
+                dest = headers.get("destination", "")
+                body = body.strip()
+                if dest == self.topic and body:
+                    try:
+                        payload = json.loads(body)
+                    except Exception as e:
+                        print(f"  {Colors.RED}MESSAGE JSON parse xato: {e} | {body}{Colors.RESET}")
+                        continue
+
+                    threading.Thread(target=ws_dispatch, args=(payload,), daemon=True).start()
+                continue
+
+            if cmd:
+                print(f"  {Colors.CYAN}STOMP OTHER: {cmd} {headers}{Colors.RESET}")
+
+    def _on_ws_error(self, ws, error):
         print(f"  {Colors.RED}✘ WS xato: {error}{Colors.RESET}")
 
-    def _on_close(self, ws, close_status_code, close_msg):
+    def _on_ws_close(self, ws, code, msg):
         self._connected.clear()
-        print(f"  {Colors.YELLOW}⚠ WS uzildi (code={close_status_code}, msg={close_msg}){Colors.RESET}")
+        print(f"  {Colors.YELLOW}⚠ WS uzildi (code={code}, msg={msg}){Colors.RESET}")
 
     def run_forever_with_reconnect(self):
         backoff = 2
         while not self._stop.is_set():
             try:
-                self._buffer = ""
+                url, session_id = _build_sockjs_ws_url(self.ws_base)
+                print(f"\n  {Colors.CYAN}WS ulanmoqda: {url}{Colors.RESET}")
                 self.ws = websocket.WebSocketApp(
-                    self.url,
+                    url,
                     on_open=self._on_open,
-                    on_message=self._on_message,
-                    on_error=self._on_error,
-                    on_close=self._on_close,
+                    on_message=self._on_ws_message,
+                    on_error=self._on_ws_error,
+                    on_close=self._on_ws_close,
                 )
-                self.ws.run_forever(ping_interval=25, ping_timeout=10)
+                sslopt = {"cert_reqs": ssl.CERT_NONE} if self.disable_ssl_verify else None
+                self.ws.run_forever(
+                    sslopt=sslopt,
+                    ping_interval=self.ping_interval,
+                    ping_timeout=self.ping_timeout,
+                )
             except Exception as e:
                 print(f"  {Colors.RED}✘ WS ulanishda xato: {e}{Colors.RESET}")
 
             if self._stop.is_set():
                 break
 
-            print(f"  {Colors.YELLOW}WS qayta ulanish {backoff}s dan keyin...{Colors.RESET}")
+            print(f"  {Colors.YELLOW}WS qayta ulanish {backoff}s dan keyin (yangi session bilan)...{Colors.RESET}")
             time.sleep(backoff)
             backoff = min(backoff * 2, 30)
 
@@ -826,7 +880,7 @@ class StompWsClient:
             except Exception:
                 pass
 
-ws_client: StompWsClient | None = None
+ws_client: SockJSTompClient | None = None
 
 def handle_command(cmd_line: str) -> bool:
     parts = cmd_line.strip().split()
@@ -991,10 +1045,13 @@ def main():
   {Colors.WHITE}install/update/revert endi {WS_TOPIC} orqali keladi.{Colors.RESET}
   {Colors.WHITE}'help' buyrug'i uchun yordam.{Colors.RESET}
 """)
-    server_id = gen_server_id()
-    session_id = gen_session_id()
-    WS_URL = f"/{server_id}/{session_id}/websocket"
-    ws_client = StompWsClient(WS_URL, WS_HOST, WS_TOPIC)
+
+    ws_client = SockJSTompClient(
+        WS_BASE, WS_HOST, WS_TOPIC,
+        disable_ssl_verify=DISABLE_SSL_VERIFY,
+        ping_interval=PING_INTERVAL,
+        ping_timeout=PING_TIMEOUT,
+    )
     ws_thread = threading.Thread(target=ws_client.run_forever_with_reconnect, daemon=True)
     ws_thread.start()
 
