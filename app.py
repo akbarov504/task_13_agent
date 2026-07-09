@@ -14,6 +14,8 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime
 
+import websocket
+
 class Colors:
     GREEN  = "\033[92m"
     RED    = "\033[91m"
@@ -29,15 +31,25 @@ API_BASE_URL   = "https://dev-gw.tracksafe365.com"
 AI_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/ai-release/download-url/{model}/{version}"
 SW_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/software-release/download-url/{model}/{version}"
 
+WS_URL   = "wss://dev-gw.tracksafe365.com/services/glsstream/stream"
+WS_HOST  = "dev-gw.tracksafe365.com"
+WS_TOPIC = "/topic/agent/command"
+
+TYPE_MAP = {"ai": "ai", "software": "sw"}
+
 BASE_DIR     = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
 AI_DIR       = BASE_DIR / "ai"
 SW_DIR       = BASE_DIR / "software"
 AI_DIR.mkdir(exist_ok=True)
 SW_DIR.mkdir(exist_ok=True)
 
+STATE_FILE = BASE_DIR / "agent_state.json"
+
 _running_processes: dict = {}
 _cached_token: str | None = None
 _token_lock = threading.Lock()
+_state_lock = threading.Lock()
+_ws_action_lock = threading.Lock()
 
 def get_token() -> str | None:
     global _cached_token
@@ -476,6 +488,7 @@ def print_status():
     net_ok, net_msg = check_internet()
     gps_ok, gps_msg = check_gps()
     py_ver          = get_python_version()
+    ws_ok           = ws_client._connected.is_set() if ws_client else False
 
     def status_icon(ok):
         return f"{Colors.GREEN}✔ ISHLAYAPTI{Colors.RESET}" if ok else f"{Colors.RED}✘ ISHLAMAYAPTI{Colors.RESET}"
@@ -487,6 +500,7 @@ def print_status():
     print(f"  {Colors.YELLOW}CAN Bus :{Colors.RESET} {status_icon(can_ok)}  — {can_msg}")
     print(f"  {Colors.YELLOW}Internet:{Colors.RESET} {status_icon(net_ok)}  — {net_msg}")
     print(f"  {Colors.YELLOW}GPS     :{Colors.RESET} {status_icon(gps_ok)}  — {gps_msg}")
+    print(f"  {Colors.YELLOW}WS/STOMP:{Colors.RESET} {status_icon(ws_ok)}  — {WS_TOPIC}")
     print(f"  {Colors.YELLOW}Python  :{Colors.RESET} {Colors.BLUE}v{py_ver}{Colors.RESET}")
     print(sep)
 
@@ -577,6 +591,8 @@ def cmd_change_python(version: str):
     print(f"  {Colors.CYAN}Yangi interpreter: {py_path}{Colors.RESET}\n")
     script = os.path.abspath(sys.argv[0])
     _stop_event.set()
+    if ws_client:
+        ws_client.stop()
     time.sleep(0.5)
     os.execv(py_path, [py_path, script] + sys.argv[1:])
 
@@ -594,6 +610,215 @@ def cmd_shutdown():
         time.sleep(1)
     subprocess.run(["sudo", "shutdown", "-h", "now"])
 
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_state(state: dict):
+    with _state_lock:
+        STATE_FILE.write_text(json.dumps(state, indent=2))
+
+def get_model_state(state: dict, kind: str, model: str) -> dict:
+    return state.get(kind, {}).get(model, {})
+
+def set_model_state(kind: str, model: str, current_version: str = None, prev_version: str = None):
+    state = load_state()
+    state.setdefault(kind, {}).setdefault(model, {})
+    entry = state[kind][model]
+    if current_version is not None:
+        entry["current_version"] = current_version
+    if prev_version is not None:
+        entry["prev_version"] = prev_version
+    entry["updated_at"] = datetime.now().isoformat()
+    save_state(state)
+    print(f"  {Colors.CYAN}[state] {kind}/{model} → current={entry.get('current_version')} prev={entry.get('prev_version')}{Colors.RESET}")
+
+def ws_handle_install(kind: str, model: str, version: str):
+    with _ws_action_lock:
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] INSTALL → {kind}/{model} v{version}{Colors.RESET}")
+        cmd_install(kind, model, version)
+        cmd_run(kind, model, version)
+        set_model_state(kind, model, current_version=version)
+
+def ws_handle_update(kind: str, model: str, version: str):
+    with _ws_action_lock:
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] UPDATE → {kind}/{model} → v{version}{Colors.RESET}")
+        state = load_state()
+        entry = get_model_state(state, kind, model)
+        old_version = entry.get("current_version")
+
+        if old_version:
+            cmd_stop(kind, model, old_version)
+            cmd_remove(kind, model, old_version)
+        else:
+            print(f"  {Colors.YELLOW}⚠ Joriy versiya topilmadi, faqat install qilinadi{Colors.RESET}")
+
+        cmd_install(kind, model, version)
+        cmd_run(kind, model, version)
+        set_model_state(kind, model, current_version=version, prev_version=old_version)
+
+def ws_handle_revert(kind: str, model: str, version: str):
+    with _ws_action_lock:
+        print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] REVERT → {kind}/{model}, joriy: v{version}{Colors.RESET}")
+        state = load_state()
+        entry = get_model_state(state, kind, model)
+        prev_version = entry.get("prev_version")
+
+        if not prev_version:
+            print(f"  {Colors.RED}✘ prev_version topilmadi ({kind}/{model}), revert qilib bo'lmaydi{Colors.RESET}")
+            return
+
+        cmd_stop(kind, model, version)
+        cmd_remove(kind, model, version)
+        cmd_install(kind, model, prev_version)
+        cmd_run(kind, model, prev_version)
+        # current/prev joylarini svop qilamiz
+        set_model_state(kind, model, current_version=prev_version, prev_version=version)
+
+def ws_dispatch(payload: dict):
+    try:
+        data = payload.get("data") or {}
+        command = (data.get("command") or "").strip().lower()
+        type_   = (data.get("type") or "").strip().lower()
+        service = data.get("service") or {}
+        model   = service.get("model")
+        version = service.get("version")
+
+        if not (command and type_ and model and version):
+            print(f"  {Colors.YELLOW}⚠ WS xabar to'liq emas: {payload}{Colors.RESET}")
+            return
+
+        kind = TYPE_MAP.get(type_)
+        if not kind:
+            print(f"  {Colors.RED}✘ Noma'lum type: '{type_}' (ai yoki software bo'lishi kerak){Colors.RESET}")
+            return
+
+        if command == "install":
+            ws_handle_install(kind, model, version)
+        elif command == "update":
+            ws_handle_update(kind, model, version)
+        elif command == "revert":
+            ws_handle_revert(kind, model, version)
+        else:
+            print(f"  {Colors.YELLOW}⚠ Noma'lum command: '{command}' (install/update/revert bo'lishi kerak){Colors.RESET}")
+
+    except Exception as e:
+        print(f"  {Colors.RED}✘ WS command bajarishda xato: {e}{Colors.RESET}")
+
+class StompWsClient:
+    def __init__(self, url: str, host: str, topic: str):
+        self.url = url
+        self.host = host
+        self.topic = topic
+        self.ws = None
+        self._connected = threading.Event()
+        self._stop = threading.Event()
+        self._buffer = ""
+
+    @staticmethod
+    def _build_frame(command: str, headers: dict, body: str = "") -> str:
+        lines = [command]
+        for k, v in headers.items():
+            lines.append(f"{k}:{v}")
+        return "\n".join(lines) + "\n\n" + body + "\x00"
+
+    def _on_open(self, ws):
+        headers = {
+            "accept-version": "1.1,1.2",
+            "host": self.host,
+            "heart-beat": "10000,10000",
+        }
+        token = get_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        ws.send(self._build_frame("CONNECT", headers))
+
+    def _on_message(self, ws, message):
+        self._buffer += message
+        while "\x00" in self._buffer:
+            raw, self._buffer = self._buffer.split("\x00", 1)
+            self._process_frame(raw.lstrip("\n"))
+
+    def _process_frame(self, raw: str):
+        if not raw.strip():
+            return
+
+        if "\n\n" in raw:
+            head, body = raw.split("\n\n", 1)
+        else:
+            head, body = raw, ""
+
+        head_lines = head.split("\n")
+        frame_cmd = head_lines[0].strip()
+
+        if frame_cmd == "CONNECTED":
+            self._connected.set()
+            print(f"  {Colors.GREEN}✔ WS/STOMP ulandi: {self.url}{Colors.RESET}")
+            sub_headers = {
+                "id": "sub-agent-cmd",
+                "destination": self.topic,
+                "ack": "auto",
+            }
+            self.ws.send(self._build_frame("SUBSCRIBE", sub_headers))
+            print(f"  {Colors.CYAN}Subscribed: {self.topic}{Colors.RESET}")
+
+        elif frame_cmd == "MESSAGE":
+            body = body.strip()
+            if body:
+                try:
+                    payload = json.loads(body)
+                except Exception as e:
+                    print(f"  {Colors.RED}✘ MESSAGE JSON parse xato: {e} | body={body}{Colors.RESET}")
+                    return
+                threading.Thread(target=ws_dispatch, args=(payload,), daemon=True).start()
+
+        elif frame_cmd == "ERROR":
+            print(f"  {Colors.RED}✘ STOMP ERROR: {body}{Colors.RESET}")
+
+    def _on_error(self, ws, error):
+        print(f"  {Colors.RED}✘ WS xato: {error}{Colors.RESET}")
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self._connected.clear()
+        print(f"  {Colors.YELLOW}⚠ WS uzildi (code={close_status_code}, msg={close_msg}){Colors.RESET}")
+
+    def run_forever_with_reconnect(self):
+        backoff = 2
+        while not self._stop.is_set():
+            try:
+                self._buffer = ""
+                self.ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                self.ws.run_forever(ping_interval=25, ping_timeout=10)
+            except Exception as e:
+                print(f"  {Colors.RED}✘ WS ulanishda xato: {e}{Colors.RESET}")
+
+            if self._stop.is_set():
+                break
+
+            print(f"  {Colors.YELLOW}WS qayta ulanish {backoff}s dan keyin...{Colors.RESET}")
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+    def stop(self):
+        self._stop.set()
+        if self.ws:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+
+ws_client: StompWsClient | None = None
+
 def handle_command(cmd_line: str) -> bool:
     parts = cmd_line.strip().split()
     if not parts:
@@ -610,7 +835,7 @@ def handle_command(cmd_line: str) -> bool:
 {Colors.BOLD}Buyruqlar:{Colors.RESET}
 
   {Colors.BOLD}{Colors.WHITE}[ SYSTEM ]{Colors.RESET}
-  {Colors.CYAN}status{Colors.RESET}                        — CAN/Internet/GPS/Python tekshir
+  {Colors.CYAN}status{Colors.RESET}                        — CAN/Internet/GPS/WS/Python tekshir
   {Colors.CYAN}reboot{Colors.RESET}                        — tizimni qayta yuklash
   {Colors.CYAN}shutdown{Colors.RESET}                      — tizimni o'chirish
 
@@ -621,7 +846,7 @@ def handle_command(cmd_line: str) -> bool:
   {Colors.CYAN}python change  <ver>{Colors.RESET}           — almashtir (python change 3.12)
   {Colors.CYAN}interval <soniya>{Colors.RESET}              — monitoring intervalini o'zgartir
 
-  {Colors.BOLD}{Colors.WHITE}[ AI MODELS ]{Colors.RESET}
+  {Colors.BOLD}{Colors.WHITE}[ AI MODELS (qo'lda test uchun) ]{Colors.RESET}
   {Colors.CYAN}ai install <model> <version>{Colors.RESET}  — AI model yuklab o'rnat
   {Colors.CYAN}ai list{Colors.RESET}                       — o'rnatilgan AI modellar
   {Colors.CYAN}ai run     <model> <version>{Colors.RESET}  — AI model ishga tushir
@@ -629,13 +854,17 @@ def handle_command(cmd_line: str) -> bool:
   {Colors.CYAN}ai remove  <model> <version>{Colors.RESET}  — AI model o'chir
   {Colors.CYAN}ai logs    <model> <version>{Colors.RESET}  — AI model loglari
 
-  {Colors.BOLD}{Colors.WHITE}[ SOFTWARE ]{Colors.RESET}
+  {Colors.BOLD}{Colors.WHITE}[ SOFTWARE (qo'lda test uchun) ]{Colors.RESET}
   {Colors.CYAN}sw install <model> <version>{Colors.RESET}  — Software yuklab o'rnat
   {Colors.CYAN}sw list{Colors.RESET}                       — o'rnatilgan softwarelar
   {Colors.CYAN}sw run     <model> <version>{Colors.RESET}  — Software ishga tushir
   {Colors.CYAN}sw stop    <model> <version>{Colors.RESET}  — Software to'xtat
   {Colors.CYAN}sw remove  <model> <version>{Colors.RESET}  — Software o'chir
   {Colors.CYAN}sw logs    <model> <version>{Colors.RESET}  — Software loglari
+
+  {Colors.BOLD}{Colors.WHITE}[ NOTE ]{Colors.RESET}
+  Endi install/update/revert asosan WEBSOCKET orqali ({WS_TOPIC})
+  avtomatik keladi. Yuqoridagi ai/sw buyruqlari qo'lda test qilish uchun qoldirildi.
 
   {Colors.CYAN}exit{Colors.RESET}                          — chiqish
 """)
@@ -733,11 +962,13 @@ def monitoring_loop():
             time.sleep(1)
 
 def main():
-    global CHECK_INTERVAL
+    global CHECK_INTERVAL, ws_client
 
     def signal_handler(sig, frame):
         print(f"\n\n{Colors.YELLOW}Ctrl+C bosildi. Agent to'xtatilmoqda...{Colors.RESET}\n")
         _stop_event.set()
+        if ws_client:
+            ws_client.stop()
         sys.exit(0)
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -745,11 +976,16 @@ def main():
     print(f"""
 {Colors.BOLD}{Colors.CYAN}╔══════════════════════════════════════════╗
 ║         SYSTEM MONITOR AGENT             ║
-║  CAN | Internet | GPS | Python | AI | SW ║
+║  CAN | Internet | GPS | WS | Python | AI ║
 ╚══════════════════════════════════════════╝{Colors.RESET}
   {Colors.WHITE}Har {CHECK_INTERVAL} soniyada avtomatik tekshiradi.{Colors.RESET}
+  {Colors.WHITE}install/update/revert endi {WS_TOPIC} orqali keladi.{Colors.RESET}
   {Colors.WHITE}'help' buyrug'i uchun yordam.{Colors.RESET}
 """)
+
+    ws_client = StompWsClient(WS_URL, WS_HOST, WS_TOPIC)
+    ws_thread = threading.Thread(target=ws_client.run_forever_with_reconnect, daemon=True)
+    ws_thread.start()
 
     monitor_thread = threading.Thread(target=monitoring_loop, daemon=True)
     monitor_thread.start()
@@ -759,10 +995,11 @@ def main():
             cmd_line = input(f"\n{Colors.BOLD}{Colors.BLUE}agent>{Colors.RESET} ").strip()
             if not handle_command(cmd_line):
                 _stop_event.set()
+                ws_client.stop()
                 break
 
         except EOFError:
-            print(f"\n{Colors.YELLOW}Stdin yo'q. Faqat monitoring rejimi.{Colors.RESET}")
+            print(f"\n{Colors.YELLOW}Stdin yo'q. Faqat monitoring/websocket rejimi.{Colors.RESET}")
             try:
                 monitor_thread.join()
             except KeyboardInterrupt:
@@ -771,6 +1008,7 @@ def main():
         
         except KeyboardInterrupt:
             _stop_event.set()
+            ws_client.stop()
             print(f"\n{Colors.YELLOW}Agent to'xtatildi.{Colors.RESET}\n")
             break
 
