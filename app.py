@@ -763,6 +763,7 @@ def report_factory_update(command: str, kind: str, model: str, version: str, suc
         )
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
+        print(f"BODY: {json.dumps(body)}")
         print(f"  {Colors.GREEN}✔ factory/update yuborildi (status={resp.status}){Colors.RESET}")
 
     except urllib.error.HTTPError as e:
