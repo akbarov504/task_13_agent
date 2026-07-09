@@ -4,6 +4,7 @@ import sys
 import ssl
 import time
 import json
+import uuid
 import random
 import string
 import socket
@@ -34,6 +35,7 @@ INFO_URL       = "http://127.0.0.1:8787/info"
 API_BASE_URL   = "https://dev-gw.tracksafe365.com"
 AI_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/ai-release/download-url/{model}/{version}"
 SW_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/software-release/download-url/{model}/{version}"
+FACTORY_UPDATE_URL = API_BASE_URL + "/services/glsmanagement/api/devices/factory/update"
 
 # ============ WEBSOCKET (SockJS + STOMP) SOZLAMALARI ============
 WS_BASE            = "wss://dev-gw.tracksafe365.com/services/glsstream/stream"
@@ -684,51 +686,207 @@ def set_model_state(kind: str, model: str, current_version: str = None, prev_ver
     print(f"  {Colors.CYAN}[state] {kind}/{model} → current={entry.get('current_version')} prev={entry.get('prev_version')}{Colors.RESET}")
 
 
+def get_mac_address() -> str:
+    # Avval haqiqiy tarmoq interfeysidan o'qishga urinamiz (Linux/embedded uchun ishonchliroq)
+    for iface in ("eth0", "end0", "enp0s3", "wlan0"):
+        path = f"/sys/class/net/{iface}/address"
+        try:
+            if os.path.exists(path):
+                mac = open(path).read().strip()
+                if mac and mac != "00:00:00:00:00:00":
+                    return mac.upper()
+        except Exception:
+            pass
+
+    # Fallback — python ichki usul
+    mac_num = uuid.getnode()
+    mac = ":".join(f"{(mac_num >> ele) & 0xff:02x}" for ele in range(40, -8, -8))
+    return mac.upper()
+
+def _build_software_list(state: dict) -> list:
+    sw_state = state.get("sw", {})
+    result = []
+    for model, entry in sw_state.items():
+        version = entry.get("current_version")
+        result.append({
+            "model": model,
+            "installed": bool(version),
+            "version": version or "",
+        })
+    return result
+
+def _get_ai_model_version(state: dict, kind: str, model: str) -> str:
+    ai_state = state.get("ai", {})
+    if kind == "ai" and model in ai_state:
+        return ai_state[model].get("current_version") or ""
+    # boshqa ai model bo'lsa ham birinchi topilganini olamiz
+    for entry in ai_state.values():
+        if entry.get("current_version"):
+            return entry["current_version"]
+    return ""
+
+def report_factory_update(command: str, kind: str, model: str, version: str, success: bool, error_msg: str = ""):
+    """
+    install/update/revert protsessi TUGAGANDAN KEYIN (natija qanday bo'lishidan
+    qat'iy nazar) shu API'ga PUT yuboriladi.
+    """
+    try:
+        state = load_state()
+        serial = get_serial_number() or ""
+        mac = get_mac_address()
+        ai_version = _get_ai_model_version(state, kind, model)
+        software = _build_software_list(state)
+
+        if success:
+            reason = f"{command} muvaffaqiyatli: {kind}/{model} v{version}"
+        else:
+            reason = f"{command} xato: {kind}/{model} v{version} — {error_msg}"
+
+        body = {
+            "reason": reason,
+            "serialNumber": serial,
+            "macAddress": mac,
+            "aiModelVersion": ai_version,
+            "software": software,
+        }
+
+        headers = {"Content-Type": "application/json"}
+        token = get_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        req = urllib.request.Request(
+            FACTORY_UPDATE_URL,
+            data=json.dumps(body).encode("utf-8"),
+            headers=headers,
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+        print(f"  {Colors.GREEN}✔ factory/update yuborildi (status={resp.status}){Colors.RESET}")
+
+    except urllib.error.HTTPError as e:
+        try:
+            err_body = e.read().decode()
+        except Exception:
+            err_body = ""
+        print(f"  {Colors.RED}✘ factory/update xato {e.code}: {e.reason} | {err_body[:300]}{Colors.RESET}")
+
+    except Exception as e:
+        print(f"  {Colors.RED}✘ factory/update yuborishda xato: {e}{Colors.RESET}")
+
+
 # ============================================================
 # ==============  WEBSOCKET COMMAND HANDLERLARI  ==============
 # ============================================================
 
+def _check_installed(kind: str, model: str, version: str) -> bool:
+    return get_binary_path(kind, model, version).exists()
+
+def _check_running(kind: str, model: str, version: str) -> bool:
+    key = f"{kind}/{model}/{version}"
+    proc = _running_processes.get(key)
+    return proc is not None and proc.poll() is None
+
 def ws_handle_install(kind: str, model: str, version: str):
     with _ws_action_lock:
         print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] INSTALL → {kind}/{model} v{version}{Colors.RESET}")
-        cmd_install(kind, model, version)
-        cmd_run(kind, model, version)
-        set_model_state(kind, model, current_version=version)
+        success = False
+        error_msg = ""
+        try:
+            cmd_install(kind, model, version)
+            installed_ok = _check_installed(kind, model, version)
+            if not installed_ok:
+                error_msg = "Install muvaffaqiyatsiz (binary topilmadi)"
+            else:
+                cmd_run(kind, model, version)
+                running_ok = _check_running(kind, model, version)
+                if not running_ok:
+                    error_msg = "Install OK, lekin run muvaffaqiyatsiz"
+                success = running_ok
+                set_model_state(kind, model, current_version=version)
+
+        except Exception as e:
+            error_msg = f"Kutilmagan xato: {e}"
+            print(f"  {Colors.RED}✘ INSTALL jarayonida xato: {e}{Colors.RESET}")
+
+        finally:
+            report_factory_update("install", kind, model, version, success, error_msg)
 
 def ws_handle_update(kind: str, model: str, version: str):
     with _ws_action_lock:
         print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] UPDATE → {kind}/{model} → v{version}{Colors.RESET}")
-        state = load_state()
-        entry = get_model_state(state, kind, model)
-        old_version = entry.get("current_version")
+        success = False
+        error_msg = ""
+        old_version = None
+        try:
+            state = load_state()
+            entry = get_model_state(state, kind, model)
+            old_version = entry.get("current_version")
 
-        if old_version:
-            cmd_stop(kind, model, old_version)
-            cmd_remove(kind, model, old_version)
-        else:
-            print(f"  {Colors.YELLOW}⚠ Joriy versiya topilmadi, faqat install qilinadi{Colors.RESET}")
+            if old_version:
+                cmd_stop(kind, model, old_version)
+                cmd_remove(kind, model, old_version)
+            else:
+                print(f"  {Colors.YELLOW}⚠ Joriy versiya topilmadi, faqat install qilinadi{Colors.RESET}")
 
-        cmd_install(kind, model, version)
-        cmd_run(kind, model, version)
-        set_model_state(kind, model, current_version=version, prev_version=old_version)
+            cmd_install(kind, model, version)
+            installed_ok = _check_installed(kind, model, version)
+            if not installed_ok:
+                error_msg = "Install muvaffaqiyatsiz (binary topilmadi)"
+            else:
+                cmd_run(kind, model, version)
+                running_ok = _check_running(kind, model, version)
+                if not running_ok:
+                    error_msg = "Install OK, lekin run muvaffaqiyatsiz"
+                success = running_ok
+                set_model_state(kind, model, current_version=version, prev_version=old_version)
+
+        except Exception as e:
+            error_msg = f"Kutilmagan xato: {e}"
+            print(f"  {Colors.RED}✘ UPDATE jarayonida xato: {e}{Colors.RESET}")
+
+        finally:
+            report_factory_update("update", kind, model, version, success, error_msg)
 
 def ws_handle_revert(kind: str, model: str, version: str):
     with _ws_action_lock:
         print(f"\n{Colors.BOLD}{Colors.CYAN}[WS] REVERT → {kind}/{model}, joriy: v{version}{Colors.RESET}")
-        state = load_state()
-        entry = get_model_state(state, kind, model)
-        prev_version = entry.get("prev_version")
+        success = False
+        error_msg = ""
+        prev_version = None
+        try:
+            state = load_state()
+            entry = get_model_state(state, kind, model)
+            prev_version = entry.get("prev_version")
 
-        if not prev_version:
-            print(f"  {Colors.RED}✘ prev_version topilmadi ({kind}/{model}), revert qilib bo'lmaydi{Colors.RESET}")
-            return
+            if not prev_version:
+                error_msg = "prev_version topilmadi, revert qilib bo'lmadi"
+                print(f"  {Colors.RED}✘ {error_msg} ({kind}/{model}){Colors.RESET}")
+            else:
+                cmd_stop(kind, model, version)
+                cmd_remove(kind, model, version)
+                cmd_install(kind, model, prev_version)
+                installed_ok = _check_installed(kind, model, prev_version)
+                if not installed_ok:
+                    error_msg = "Revert install muvaffaqiyatsiz (binary topilmadi)"
+                else:
+                    cmd_run(kind, model, prev_version)
+                    running_ok = _check_running(kind, model, prev_version)
+                    if not running_ok:
+                        error_msg = "Revert install OK, lekin run muvaffaqiyatsiz"
+                    success = running_ok
+                    # current/prev joylarini svop qilamiz
+                    set_model_state(kind, model, current_version=prev_version, prev_version=version)
 
-        cmd_stop(kind, model, version)
-        cmd_remove(kind, model, version)
-        cmd_install(kind, model, prev_version)
-        cmd_run(kind, model, prev_version)
-        # current/prev joylarini svop qilamiz
-        set_model_state(kind, model, current_version=prev_version, prev_version=version)
+        except Exception as e:
+            error_msg = f"Kutilmagan xato: {e}"
+            print(f"  {Colors.RED}✘ REVERT jarayonida xato: {e}{Colors.RESET}")
+
+        finally:
+            # revert holatida haqiqatda o'rnatilishi kerak bo'lgan versiya prev_version
+            report_version = prev_version or version
+            report_factory_update("revert", kind, model, report_version, success, error_msg)
 
 def ws_dispatch(payload: dict):
     try:
