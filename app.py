@@ -734,8 +734,8 @@ def ws_dispatch(payload: dict):
     try:
         data = payload.get("data") or {}
         command = (data.get("command") or "").strip().lower()
-        type_   = (data.get("type") or "").strip().lower()
         service = data.get("service") or {}
+        type_   = (service.get("type") or data.get("type") or "").strip().lower()
         model   = service.get("model")
         version = service.get("version")
 
