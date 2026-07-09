@@ -6,6 +6,8 @@ import json
 import socket
 import shutil
 import signal
+import random
+import string
 import platform
 import threading
 import subprocess
@@ -50,6 +52,13 @@ _cached_token: str | None = None
 _token_lock = threading.Lock()
 _state_lock = threading.Lock()
 _ws_action_lock = threading.Lock()
+
+def gen_server_id() -> str:
+    return f"{random.randint(0, 999):03d}"
+
+def gen_session_id(n: int = 8) -> str:
+    alphabet = string.ascii_lowercase + string.digits
+    return "".join(random.choice(alphabet) for _ in range(n))
 
 def get_token() -> str | None:
     global _cached_token
@@ -982,7 +991,9 @@ def main():
   {Colors.WHITE}install/update/revert endi {WS_TOPIC} orqali keladi.{Colors.RESET}
   {Colors.WHITE}'help' buyrug'i uchun yordam.{Colors.RESET}
 """)
-
+    server_id = gen_server_id()
+    session_id = gen_session_id()
+    WS_URL = f"/{server_id}/{session_id}/websocket"
     ws_client = StompWsClient(WS_URL, WS_HOST, WS_TOPIC)
     ws_thread = threading.Thread(target=ws_client.run_forever_with_reconnect, daemon=True)
     ws_thread.start()
