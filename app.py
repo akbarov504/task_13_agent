@@ -17,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from datetime import datetime
 
-import websocket
+import websocket  # pip install websocket-client
 
 class Colors:
     GREEN  = "\033[92m"
@@ -30,10 +30,12 @@ class Colors:
     WHITE  = "\033[97m"
 
 TOKEN_URL      = "http://127.0.0.1:8787/token"
+INFO_URL       = "http://127.0.0.1:8787/info"
 API_BASE_URL   = "https://dev-gw.tracksafe365.com"
 AI_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/ai-release/download-url/{model}/{version}"
 SW_RELEASE_URL = API_BASE_URL + "/services/glsmanagement/api/software-release/download-url/{model}/{version}"
 
+# ============ WEBSOCKET (SockJS + STOMP) SOZLAMALARI ============
 WS_BASE            = "wss://dev-gw.tracksafe365.com/services/glsstream/stream"
 WS_HOST            = "dev-gw.tracksafe365.com"
 WS_TOPIC           = "/topic/agent/command"
@@ -41,6 +43,7 @@ DISABLE_SSL_VERIFY = False
 PING_INTERVAL      = 25
 PING_TIMEOUT       = 10
 
+# frontend/backenddan keladigan "type" -> bizning ichki "kind" (ai/sw)
 TYPE_MAP = {"ai": "ai", "software": "sw"}
 
 BASE_DIR     = Path(os.path.dirname(os.path.abspath(sys.argv[0])))
@@ -53,9 +56,11 @@ STATE_FILE = BASE_DIR / "agent_state.json"
 
 _running_processes: dict = {}
 _cached_token: str | None = None
+_cached_serial: str | None = None
 _token_lock = threading.Lock()
+_serial_lock = threading.Lock()
 _state_lock = threading.Lock()
-_ws_action_lock = threading.Lock()
+_ws_action_lock = threading.Lock()   # bir vaqtda faqat bitta install/update/revert ketsin
 
 def get_token() -> str | None:
     global _cached_token
@@ -81,6 +86,35 @@ def get_token() -> str | None:
         
         except Exception as e:
             print(f"  {Colors.RED}Token olishda xato: {e}{Colors.RESET}")
+            return None
+
+def get_serial_number() -> str | None:
+    global _cached_serial
+    with _serial_lock:
+        if _cached_serial:
+            return _cached_serial
+
+        try:
+            req = urllib.request.Request(INFO_URL)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode())
+
+            serial = data.get("serialNumber")
+            if not serial:
+                serial = data.get("serial_number")
+
+            if not serial and isinstance(data.get("result"), dict):
+                serial = data["result"].get("serialNumber") or data["result"].get("serial_number")
+
+            if serial:
+                _cached_serial = str(serial)
+                return _cached_serial
+
+            print(f"  {Colors.RED}serialNumber topilmadi. Response: {data}{Colors.RESET}")
+            return None
+
+        except Exception as e:
+            print(f"  {Colors.RED}/info dan serialNumber olishda xato: {e}{Colors.RESET}")
             return None
 
 def get_download_url(kind: str, model: str, version: str) -> str | None:
@@ -495,6 +529,7 @@ def print_status():
     gps_ok, gps_msg = check_gps()
     py_ver          = get_python_version()
     ws_ok           = ws_client._connected.is_set() if ws_client else False
+    ws_topic_display = ws_client.full_topic if (ws_client and ws_client.full_topic) else f"{WS_TOPIC}/..."
 
     def status_icon(ok):
         return f"{Colors.GREEN}✔ ISHLAYAPTI{Colors.RESET}" if ok else f"{Colors.RED}✘ ISHLAMAYAPTI{Colors.RESET}"
@@ -506,7 +541,7 @@ def print_status():
     print(f"  {Colors.YELLOW}CAN Bus :{Colors.RESET} {status_icon(can_ok)}  — {can_msg}")
     print(f"  {Colors.YELLOW}Internet:{Colors.RESET} {status_icon(net_ok)}  — {net_msg}")
     print(f"  {Colors.YELLOW}GPS     :{Colors.RESET} {status_icon(gps_ok)}  — {gps_msg}")
-    print(f"  {Colors.YELLOW}WS/STOMP:{Colors.RESET} {status_icon(ws_ok)}  — {WS_TOPIC}")
+    print(f"  {Colors.YELLOW}WS/STOMP:{Colors.RESET} {status_icon(ws_ok)}  — {ws_topic_display}")
     print(f"  {Colors.YELLOW}Python  :{Colors.RESET} {Colors.BLUE}v{py_ver}{Colors.RESET}")
     print(sep)
 
@@ -616,6 +651,11 @@ def cmd_shutdown():
         time.sleep(1)
     subprocess.run(["sudo", "shutdown", "-h", "now"])
 
+
+# ============================================================
+# ================  STATE (current/prev version)  ============
+# ============================================================
+
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
@@ -642,6 +682,11 @@ def set_model_state(kind: str, model: str, current_version: str = None, prev_ver
     entry["updated_at"] = datetime.now().isoformat()
     save_state(state)
     print(f"  {Colors.CYAN}[state] {kind}/{model} → current={entry.get('current_version')} prev={entry.get('prev_version')}{Colors.RESET}")
+
+
+# ============================================================
+# ==============  WEBSOCKET COMMAND HANDLERLARI  ==============
+# ============================================================
 
 def ws_handle_install(kind: str, model: str, version: str):
     with _ws_action_lock:
@@ -682,6 +727,7 @@ def ws_handle_revert(kind: str, model: str, version: str):
         cmd_remove(kind, model, version)
         cmd_install(kind, model, prev_version)
         cmd_run(kind, model, prev_version)
+        # current/prev joylarini svop qilamiz
         set_model_state(kind, model, current_version=prev_version, prev_version=version)
 
 def ws_dispatch(payload: dict):
@@ -713,6 +759,14 @@ def ws_dispatch(payload: dict):
 
     except Exception as e:
         print(f"  {Colors.RED}✘ WS command bajarishda xato: {e}{Colors.RESET}")
+
+
+# ============================================================
+# ================  SockJS + STOMP over WebSocket  ============
+# ============================================================
+# Eslatma: bu qism eski (ishlab turgan) WebRTC agentdagi stomp_sockjs.py
+# bilan bir xil pattern asosida yozilgan — dev-gw.tracksafe365.com
+# SockJS envelope (o/h/a[...]/c...) kutadi, raw STOMP frame emas.
 
 NULL_BYTE = "\x00"
 
@@ -754,6 +808,7 @@ def _parse_stomp_frame(raw: str):
 def _sockjs_send(ws, stomp_frame: str):
     ws.send(json.dumps([stomp_frame]))
 
+
 class SockJSTompClient:
     def __init__(self, ws_base: str, host: str, topic: str,
                  disable_ssl_verify: bool = False,
@@ -768,6 +823,8 @@ class SockJSTompClient:
         self.ws: websocket.WebSocketApp | None = None
         self._connected = threading.Event()
         self._stop = threading.Event()
+        self.session_id: str | None = None
+        self.full_topic: str | None = None
 
     def _on_open(self, ws):
         token = get_token()
@@ -783,16 +840,26 @@ class SockJSTompClient:
         print(f"  {Colors.CYAN}WS OPEN + STOMP CONNECT yuborildi{Colors.RESET}")
 
     def _subscribe(self):
+        if not self._connected.is_set():
+            return  # bu orada WS uzilib, qayta ulangan bo'lishi mumkin — eski urinishni bekor qilamiz
+
+        serial = get_serial_number()
+        if not serial:
+            print(f"  {Colors.RED}✘ serialNumber olinmadi, 3s dan keyin qayta urinamiz...{Colors.RESET}")
+            threading.Timer(3.0, self._subscribe).start()
+            return
+
+        self.full_topic = f"{self.topic}/{serial}/{self.session_id}"
         frame = _build_stomp_frame(
             "SUBSCRIBE",
-            {"id": "sub-agent-cmd", "destination": self.topic, "ack": "auto"},
+            {"id": "sub-agent-cmd", "destination": self.full_topic, "ack": "auto"},
         )
         _sockjs_send(self.ws, frame)
-        print(f"  {Colors.CYAN}Subscribed: {self.topic}{Colors.RESET}")
+        print(f"  {Colors.CYAN}Subscribed: {self.full_topic}{Colors.RESET}")
 
     def _on_ws_message(self, ws, message: str):
         if message in ("o", "h"):
-            return
+            return  # SockJS open / heartbeat
 
         if message.startswith("c"):
             print(f"  {Colors.YELLOW}SockJS CLOSE: {message}{Colors.RESET}")
@@ -823,13 +890,14 @@ class SockJSTompClient:
             if cmd == "MESSAGE":
                 dest = headers.get("destination", "")
                 body = body.strip()
-                if dest == self.topic and body:
+                if self.full_topic and dest == self.full_topic and body:
                     try:
                         payload = json.loads(body)
                     except Exception as e:
                         print(f"  {Colors.RED}MESSAGE JSON parse xato: {e} | {body}{Colors.RESET}")
                         continue
-
+                    # og'ir ish bo'lgani uchun alohida thread'da bajaramiz —
+                    # WS loop bloklanib qolmasin
                     threading.Thread(target=ws_dispatch, args=(payload,), daemon=True).start()
                 continue
 
@@ -848,6 +916,8 @@ class SockJSTompClient:
         while not self._stop.is_set():
             try:
                 url, session_id = _build_sockjs_ws_url(self.ws_base)
+                self.session_id = session_id
+                self.full_topic = None
                 print(f"\n  {Colors.CYAN}WS ulanmoqda: {url}{Colors.RESET}")
                 self.ws = websocket.WebSocketApp(
                     url,
@@ -881,6 +951,7 @@ class SockJSTompClient:
                 pass
 
 ws_client: SockJSTompClient | None = None
+
 
 def handle_command(cmd_line: str) -> bool:
     parts = cmd_line.strip().split()
